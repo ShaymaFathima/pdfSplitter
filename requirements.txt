@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pytesseract
+numpy
+PyMuPDF  # For fitz
+PyPDF2
+opencv-python-headless
+python-multipart  # For file uploads
