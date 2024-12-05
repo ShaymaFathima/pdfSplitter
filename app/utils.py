@@ -9,9 +9,12 @@ from PyPDF2 import PdfReader, PdfWriter
 import pytesseract
 from datetime import datetime
 from pdf2image import convert_from_path
-import pytesseract
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+#tesseract_path = shutil.which("tesseract")
+#pytesseract.tesseract_cmd = tesseract_path
 
+
+#poppler_path = shutil.which("pdftoppm")
 poppler_path = "C:\\Users\\moham\\Downloads\\Release-24.08.0-0\\poppler-24.08.0\\Library\\bin"
 
 def convert_pdf_to_images(pdf_path):
@@ -55,17 +58,35 @@ def identify_template(page_image, logo_templates):
             "type": "logo_and_text",
             "logo_coords": (430, 0, 595, 100),  # Coordinates for the logo
             "text_coords": (0, 50, 595, 200),  # Coordinates for the text
-            "keywords": ["CHEQUE", "Date"]
+            "keywords": ["CHEQUE", "Date"],
+            "logo_threshold": 0.3,
+            "text_match_threshold": 2
         },
         "Internal Bank Advice": {
             "type": "text",
             "coords": (0, 100, 595, 350),
             "keywords": ["INTERNAL BANK ADVICE", "DATE", "BANK NAME", "BRANCH NUMBER", "ACCOUNT NUMBER"]
         },
-        "Staff Form": {
-            "type": "text",
-            "coords": (0, 100, 595, 350),
-            "keywords": ["Voucher No", "Date", "Subject", "Gentlemen:", "BENEFICIARY NAME", "ACCOUNT NO.", "BRANCH NO.", "AMOUNT SR"]
+       "Staff Form": {
+            "type": "structural",
+            "regions": [
+                {
+                    "coords": (0, 300, 595, 400),  # Table header region
+                    "keywords": ["beneficiary name", "account no", "branch no", "amount sr"],
+                    "minimum_matches": 2
+                },
+                {
+                    "coords": (0, 250, 595, 600),  # Main text region
+                    "keywords": ["please arrange to transfer", "please debit the total amount", "authorized signature"],
+                    "minimum_matches": 1
+                },
+                {
+                    "coords": (0, 100, 595, 350),  # Voucher area
+                    "keywords": ["voucher no"],
+                    "minimum_matches": 1
+                }
+            ],
+            "required_matches": 1  
         },
     }
 
@@ -75,31 +96,49 @@ def identify_template(page_image, logo_templates):
             x0, y0, x1, y1 = details["logo_coords"]
             cropped_image = page_image[y0:y1, x0:x1]
             match_score = match_logo_template(cropped_image, logo_templates[template_name])
-            
+            logo_threshold = details.get("logo_threshold", 0.3)
+
             # Check for text match
             x0, y0, x1, y1 = details["text_coords"]
             extracted_text = extract_text_from_region(page_image, (x0, y0, x1, y1))
             extracted_text_lower = extracted_text.lower()
             keywords_lower = [keyword.lower() for keyword in details["keywords"]]
-            
-            # Check if all keywords are present in the extracted text
-            if match_score > 0.4 and all(keyword in extracted_text_lower for keyword in keywords_lower):
+            keyword_matches = sum(1 for keyword in keywords_lower if keyword in extracted_text_lower)
+
+            text_match_threshold = details.get("text_match_threshold", 1)
+            if (match_score > logo_threshold and 
+                keyword_matches >= text_match_threshold):
                 return template_name
 
         elif details["type"] == "logo":
             x0, y0, x1, y1 = details["coords"]
             cropped_image = page_image[y0:y1, x0:x1]
             match_score = match_logo_template(cropped_image, logo_templates[template_name])
-            if match_score > 0.4:
+            if match_score > 0.5:
                 return template_name
-        
+
         elif details["type"] == "text":
             x0, y0, x1, y1 = details["coords"]
             extracted_text = extract_text_from_region(page_image, (x0, y0, x1, y1))
             extracted_text_lower = extracted_text.lower()
             keywords_lower = [keyword.lower() for keyword in details["keywords"]]
-            
+
             if all(keyword in extracted_text_lower for keyword in keywords_lower):
+                return template_name
+
+        elif details["type"] == "structural":
+            matches = 0
+            # Check each region for its required keywords
+            for region in details["regions"]:
+                x0, y0, x1, y1 = region["coords"]
+                extracted_text = extract_text_from_region(page_image, (x0, y0, x1, y1))
+                extracted_text_lower = extracted_text.lower()
+                keyword_matches = sum(1 for keyword in region["keywords"]
+                                   if keyword.lower() in extracted_text_lower)
+                if keyword_matches >= region["minimum_matches"]:
+                    matches += 1
+
+            if matches >= details["required_matches"]:
                 return template_name
 
     return None
@@ -193,6 +232,7 @@ def extract_voucher_number_and_date(text):
             # If parsing fails, return the original matched string
             date = date_str.replace('/', '-').replace(' ', '-')
     else:
+        
         date = None
 
     return voucher_number, date
