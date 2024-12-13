@@ -12,8 +12,6 @@ app = FastAPI()
 # Mount the static folder
 app.mount("/uploads", StaticFiles(directory=uploads_path), name="uploads")
 
-# Your other API routes go here
-
 # Enable CORS from all origins
 app.add_middleware(
     CORSMiddleware,
