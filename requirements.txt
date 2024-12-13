@@ -6,3 +6,6 @@ PyMuPDF  # For fitz
 PyPDF2
 opencv-python-headless
 python-multipart  # For file uploads
+pdf2image
+scikit-image
+aiofiles

@@ -1,13 +1,20 @@
 import re
 import os
 import shutil
-from typing import List
+from typing import List, Tuple
 import fitz
 import cv2
 import numpy as np
-from PyPDF2 import PdfReader, PdfWriter
+import uuid
 import pytesseract
 from datetime import datetime
+from fastapi import UploadFile, HTTPException
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
+from functools import lru_cache
+import aiofiles
+import asyncio
+import logging
 from pdf2image import convert_from_path
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 #tesseract_path = shutil.which("tesseract")
@@ -17,14 +24,16 @@ pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tessera
 #poppler_path = shutil.which("pdftoppm")
 poppler_path = "C:\\Users\\moham\\Downloads\\Release-24.08.0-0\\poppler-24.08.0\\Library\\bin"
 
+
 def convert_pdf_to_images(pdf_path):
-  doc = fitz.open(pdf_path)
-  images = []
-  for page in doc:
-    pix = page.get_pixmap()
-    img = np.frombuffer(pix.samples,dtype=np.uint8).reshape(pix.height, pix.width, 3)
-    images.append(img)
-  return images
+    doc = fitz.open(pdf_path)
+    images = []
+    for page in doc:
+        pix = page.get_pixmap()
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        images.append(img)
+    doc.close()
+    return images
 
 def extract_text_from_region(image, bbox, lang="eng"):
     x0, y0, x1, y1 = bbox
@@ -32,13 +41,14 @@ def extract_text_from_region(image, bbox, lang="eng"):
     text = pytesseract.image_to_string(cropped_image, lang=lang)
     return text.strip()
 
+@lru_cache(maxsize=None)
 def get_pdf_page_size(pdf_path):
+    # Cache page size calculations
     doc = fitz.open(pdf_path)
     page = doc[0]
-    return page.rect.width, page.rect.height
-
-def resize_image(image, target_width, target_height):
-    return cv2.resize(image, (int(target_width), int(target_height)))
+    width, height = page.rect.width, page.rect.height
+    doc.close()
+    return width, height
 
 def match_logo_template(cropped_image, logo_templates):
     for logo_template in logo_templates:
@@ -49,8 +59,6 @@ def match_logo_template(cropped_image, logo_templates):
         if max_val >= 0.4:
             return max_val
     return 0
-
-
 
 def identify_template(page_image, logo_templates):
     templates = {
@@ -95,7 +103,9 @@ def identify_template(page_image, logo_templates):
             # Check for logo match
             x0, y0, x1, y1 = details["logo_coords"]
             cropped_image = page_image[y0:y1, x0:x1]
+            
             match_score = match_logo_template(cropped_image, logo_templates[template_name])
+            
             logo_threshold = details.get("logo_threshold", 0.3)
 
             # Check for text match
@@ -143,25 +153,29 @@ def identify_template(page_image, logo_templates):
 
     return None
 
-
+def identify_template_wrapper(args):
+    page, logo_templates = args
+    return identify_template(page, logo_templates)
 
 def find_splitting_page_numbers(pdf_path, logo_templates):
     pages = convert_pdf_to_images(pdf_path)  
     split_pages = []  
     sub_doc_start = 0  
 
-    for i, page_image in enumerate(pages):
-        template = identify_template(page_image, logo_templates)  # Identify the template for each page
-        if template:  # If a template match is found, it indicates a split
+    page_args = [(page, logo_templates) for page in pages]
+    with ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
+        templates = list(executor.map(identify_template_wrapper, page_args))
+
+    # Process identified templates sequentially to maintain original splitting logic
+    for i, template in enumerate(templates):
+        if template:
             if sub_doc_start != i:
-                split_pages.append(sub_doc_start + 1)  # Add the split page number (1-based index)
-            sub_doc_start = i  # Update sub-document start to current page
+                split_pages.append(sub_doc_start + 1)
+            sub_doc_start = i 
     
-    # Append the last split page after the loop ends
     split_pages.append(sub_doc_start + 1)  
     
-    return split_pages  # Return the list of splitting page numbers
-
+    return split_pages
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 def load_templates():
@@ -175,13 +189,39 @@ def load_templates():
     
     return cheque_image, bank_advice_image, staff_form_image
 
-def extract_text_from_pdf(pdf_path):
-    images = convert_from_path(pdf_path, first_page=1, last_page=1, dpi=300, poppler_path=poppler_path)
-    if images:
-        # OCR on the first page image with English only
-        text = pytesseract.image_to_string(images[0], lang='eng')
-        return text
-    return ""
+
+def resize_image(image, width, height):
+    return cv2.resize(image, (int(width), int(height)))
+
+@lru_cache(maxsize=1)
+def load_and_prepare_templates(width, height):
+    """Cached and optimized template loading"""
+    cheque, bank_advice, staff_form = load_templates()
+    
+    cheque_resized = resize_image(cheque, width, height)
+    bank_advice_resized = resize_image(bank_advice, width, height)
+    staff_form_resized = resize_image(staff_form, width, height)
+    
+    return {
+        "Cheque": [cheque_resized],
+        "Internal Bank Advice": [bank_advice_resized],
+        "Staff Form": [staff_form_resized]
+    }
+
+
+def preprocess_file(file_path):
+    target_width, target_height = get_pdf_page_size(file_path)
+    logo_templates = load_and_prepare_templates(target_width, target_height)
+    splitting_page_numbers = find_splitting_page_numbers(file_path, logo_templates)
+    return splitting_page_numbers
+
+
+# Save file asynchronously with aiofiles
+async def save_file(file: UploadFile, file_path: str):
+    """Asynchronously save the uploaded file to the filesystem."""
+    async with aiofiles.open(file_path, 'wb') as f:
+        while chunk := await file.read(8 * 1024 * 1024):  # Read in 8MB chunks
+            await f.write(chunk)
 
 
 def list_folders(directory: str) -> List[str]:
@@ -190,10 +230,73 @@ def list_folders(directory: str) -> List[str]:
     return [folder for folder in os.listdir(directory) if os.path.isdir(os.path.join(directory, folder))]
 
 
-def list_files_in_folder(folder_path: str):
-    if not os.path.exists(folder_path):
-        return []
-    return [file for file in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, file))]
+def split_and_save_pdfs(pdf_details: List[dict]) -> List[str]:
+    base_uploads_dir = os.path.join("app", "uploads")
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    split_folder = os.path.join(base_uploads_dir, "split", timestamp)
+    os.makedirs(split_folder, exist_ok=True)
+
+    split_files = []
+    for pdf_info in pdf_details:
+        pdf_path = pdf_info["pdf_path"]
+        split_numbers = pdf_info["split_numbers"]
+
+        # Validate the PDF path
+        if not os.path.exists(pdf_path):
+            raise HTTPException(status_code=404, detail=f"PDF not found: {pdf_path}")
+        
+        # Open the PDF
+        pdf = fitz.open(pdf_path)
+        total_pages = pdf.page_count
+       
+        # Ensure split numbers are valid
+        split_numbers = sorted(set(split_numbers))  # Remove duplicates and sort
+        split_numbers = [s for s in split_numbers if 1 <= s <= total_pages]  # Filter out-of-bounds
+        
+        ranges = []
+        for i in range(len(split_numbers)):
+            if i == len(split_numbers) - 1:
+                ranges.append((split_numbers[i] - 1, total_pages - 1))
+            else:
+                 ranges.append((split_numbers[i] - 1, split_numbers[i + 1] - 2))
+       
+        # Split the PDF into sub-documents
+        for index, (start_page, end_page) in enumerate(ranges):
+            writer = fitz.open()
+
+            # Add pages to the new sub-document
+            for page_number in range(start_page, end_page + 1): 
+                writer.insert_pdf(pdf, from_page=page_number, to_page=page_number)
+
+            # Skip empty sub-documents 
+            if len(writer) == 0: 
+                writer.close()
+                continue
+
+            # Save the sub-document
+            split_filename = f"split_{os.path.basename(pdf_path).replace('.pdf', '')}_{index + 1}.pdf"
+            split_file_path = os.path.join(split_folder, split_filename)
+            writer.save(split_file_path)
+            writer.close()
+
+            # Append the file path to the result list
+            split_files.append(split_file_path)
+             
+        pdf.close()
+
+    # Adjust paths to start from 'uploads'
+    split_files = [os.path.relpath(path, base_uploads_dir) for path in split_files]
+    return {"timestamp": timestamp, "split_files": split_files}
+    
+
+
+def extract_text_from_pdf(pdf_path):
+    images = convert_from_path(pdf_path, first_page=1, last_page=1, dpi=300, poppler_path=poppler_path)
+    if images:
+        # OCR on the first page image with English only
+        text = pytesseract.image_to_string(images[0], lang='eng')
+        return text
+    return ""
 
 
 def extract_voucher_number_and_date(text):
@@ -238,93 +341,60 @@ def extract_voucher_number_and_date(text):
     return voucher_number, date
 
 
-def split_and_rename_pdfs(pdf_path, split_numbers, success_folder, failure_folder):
+def create_subfolders(base_folder: str) -> Tuple[str, str]:
     """
-    Splits a PDF based on known page numbers and renames files based on voucher and date.
+    Create success and failure subfolders within the given base folder.
+    Returns the paths to the success and failure subfolders.
     """
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    
-    # Create timestamped subfolders for success and failure
-    success_subfolder = os.path.join(success_folder, timestamp)
-    failure_subfolder = os.path.join(failure_folder, timestamp)
+    success_folder = os.path.join(base_folder, "success")
+    failure_folder = os.path.join(base_folder, "failure")
+    os.makedirs(success_folder, exist_ok=True)
+    os.makedirs(failure_folder, exist_ok=True)
+    return success_folder, failure_folder
 
-    os.makedirs(success_subfolder, exist_ok=True)
-    os.makedirs(failure_subfolder, exist_ok=True)
 
-    # Open the PDF
-    pdf = fitz.open(pdf_path)
-    total_pages = pdf.page_count
-
-    # Ensure split numbers are valid
-    split_numbers = sorted(set(split_numbers)) # Remove duplicates and sort
-    split_numbers = [s for s in split_numbers if 1 <= s <= total_pages] # Filter out-of-bounds
-    
-
-    ranges = []
-    for i in range(len(split_numbers)):
-        if i == len(split_numbers) - 1:
-            # Last split number - create range from this number to end of PDF
-            ranges.append((split_numbers[i] - 1, total_pages - 1))
-        else:
-            if i == 0 and split_numbers[0] == 1:
-                # First page is a split point - handle it separately
-                ranges.append((0, 0))
-                if len(split_numbers) > 1:
-                    # Add range from page 2 to next split point - 1
-                    ranges.append((1, split_numbers[1] - 1))
-            else:
-                # Regular case - from current split point to next split point - 1
-                start = split_numbers[i] - 1  # Convert to 0-based index
-                end = split_numbers[i + 1] - 2  # -2 to not include next split point
-                ranges.append((start, end))
-
-    print("Debug - Page ranges to be created:", [(r[0]+1, r[1]+1) for r in ranges])
-
-    for index, (start_page, end_page) in enumerate(ranges):
-        writer = fitz.open()
-        
-        # Copy pages for this range
-        for page_number in range(start_page, end_page + 1):
-            writer.insert_pdf(pdf, from_page=page_number, to_page=page_number)
-        
-        # Skip empty writers
-        if len(writer) == 0:
-            print(f"Skipping empty split from {start_page + 1} to {end_page + 1}")
-            writer.close()
-            continue
-
-        # Save temporary sub-document
-        temp_filename = f"temp_split_{index + 1}.pdf"
-        temp_path = os.path.join("temp", temp_filename)
-        os.makedirs("temp", exist_ok=True)
-        writer.save(temp_path)
-        writer.close()
-
-        # Extract text and rename
-        text = extract_text_from_pdf(temp_path)
+def process_file(file_path: str, success_folder: str, failure_folder: str) -> Tuple[str, str]:
+    """
+    Process a file: extract metadata and move to success or failure folder.
+    Returns the new file path (if successful) or the failure file path.
+    """
+    try:
+        # Simulated metadata extraction
+        text = extract_text_from_pdf(file_path)
         voucher_number, date = extract_voucher_number_and_date(text)
 
         if voucher_number and date:
-            date = date.replace("/", "-").replace(" ", "-")
             new_filename = f"{voucher_number}_{date}.pdf"
-            new_file_path = os.path.join(success_subfolder, new_filename)
-            try:
-                shutil.move(temp_path, new_file_path)
-                print(f"Split pages {start_page + 1}-{end_page + 1} -> '{new_filename}'")
-            except Exception as e:
-                print(f"Error moving file: {e}")
-                # If moving fails, try to save to failure folder
-                failure_path = os.path.join(failure_subfolder, temp_filename)
-                shutil.move(temp_path, failure_path)
-                print(f"Moved to failure folder due to error: {temp_filename}")
+            new_path = os.path.join(success_folder, new_filename)
+            shutil.move(file_path, new_path)  # Move to success folder
+            return new_path, None
         else:
-            # If renaming fails, move the original file to the failure subfolder
-            new_file_path = os.path.join(failure_subfolder, f"{temp_filename}")
-            shutil.move(temp_path, new_file_path)
-            print(f"Failed to extract details from pages {start_page + 1}-{end_page + 1}")
+            failure_path = os.path.join(failure_folder, os.path.basename(file_path))
+            shutil.move(file_path, failure_path)  # Move to failure folder
+            return None, failure_path
+    except Exception as e:
+        failure_path = os.path.join(failure_folder, os.path.basename(file_path))
+        shutil.move(file_path, failure_path)  # Move to failure folder
+        return None, failure_path
 
-        
 
-    pdf.close()
+def handle_files_in_folder(folder_path: str, success_folder: str, failure_folder: str) -> Tuple[List[str], List[str]]:
+    """
+    Handle all files in a folder, renaming and categorizing into success and failure.
+    Returns lists of success and failure file paths.
+    """
+    renamed_files = []
+    failed_files = []
 
-    return success_subfolder, failure_subfolder
+    for file_name in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, file_name)
+        if not os.path.isfile(file_path):  # Skip directories
+            continue
+
+        success, failure = process_file(file_path, success_folder, failure_folder)
+        if success:
+            renamed_files.append(success)
+        if failure:
+            failed_files.append(failure)
+
+    return renamed_files, failed_files
